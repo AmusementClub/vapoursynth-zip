@@ -13,22 +13,40 @@ const ZAPI = vapoursynth.ZAPI;
 
 const allocator = std.heap.c_allocator;
 pub const filter_name = "SSIMULACRA2";
+const Scratch = []align(vszip.vec_len) f32;
 
 const Data = struct {
     node1: ?*vs.Node = null,
     node2: ?*vs.Node = null,
+    // Reusable scratch buffers; getFrame runs concurrently so each call pops
+    // its own buffer (or allocates one) and pushes it back when done.
+    pool: std.ArrayList(Scratch) = .empty,
+    pool_mutex: std.Io.Mutex = .init,
 };
 
-fn ssimulacra2GetFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) ?*const vs.Frame {
+fn acquireScratch(d: *Data, size: usize) Scratch {
+    d.pool_mutex.lockUncancelable(vszip.io);
+    defer d.pool_mutex.unlock(vszip.io);
+    if (d.pool.pop()) |buf| return buf;
+    return allocator.alignedAlloc(f32, vszip.alignment, size) catch unreachable;
+}
+
+fn releaseScratch(d: *Data, buf: Scratch) void {
+    d.pool_mutex.lockUncancelable(vszip.io);
+    defer d.pool_mutex.unlock(vszip.io);
+    d.pool.append(allocator, buf) catch unreachable;
+}
+
+fn ssimulacra2GetFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) ?*const vs.Frame {
     const d: *Data = @ptrCast(@alignCast(instance_data));
-    const zapi = ZAPI.init(vsapi, core);
+    const zapi = ZAPI.init(vsapi, core, frame_ctx);
 
     if (activation_reason == .Initial) {
-        zapi.requestFrameFilter(n, d.node1, frame_ctx);
-        zapi.requestFrameFilter(n, d.node2, frame_ctx);
+        zapi.requestFrameFilter(n, d.node1);
+        zapi.requestFrameFilter(n, d.node2);
     } else if (activation_reason == .AllFramesReady) {
-        const src1 = zapi.initZFrame(d.node1, n, frame_ctx);
-        const src2 = zapi.initZFrame(d.node2, n, frame_ctx);
+        const src1 = zapi.initZFrame(d.node1, n);
+        const src2 = zapi.initZFrame(d.node2, n);
         defer src1.deinit();
         defer src2.deinit();
 
@@ -37,7 +55,9 @@ fn ssimulacra2GetFrame(n: c_int, activation_reason: vs.ActivationReason, instanc
 
         const srcp1 = src1.getReadSlices2(f32);
         const srcp2 = src2.getReadSlices2(f32);
-        const val = filter_ssim.process(srcp1, srcp2, stride, w, h);
+        const scratch = acquireScratch(d, filter_ssim.scratchSize(stride, w, h));
+        defer releaseScratch(d, scratch);
+        const val = filter_ssim.process(srcp1, srcp2, stride, w, h, scratch);
         const dst_prop = dst.getPropertiesRW();
         dst_prop.setFloat("SSIMULACRA2", val, .Replace);
         return dst.frame;
@@ -45,19 +65,24 @@ fn ssimulacra2GetFrame(n: c_int, activation_reason: vs.ActivationReason, instanc
     return null;
 }
 
-fn ssimulacraFree(instance_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) void {
+fn ssimulacraFree(instance_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     const d: *Data = @ptrCast(@alignCast(instance_data));
-    const zapi = ZAPI.init(vsapi, core);
+    const zapi = ZAPI.init(vsapi, core, null);
+
+    for (d.pool.items) |buf| {
+        allocator.free(buf);
+    }
+    d.pool.deinit(allocator);
 
     zapi.freeNode(d.node1);
     zapi.freeNode(d.node2);
     allocator.destroy(d);
 }
 
-pub fn ssimulacraCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) void {
+pub fn ssimulacraCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     var d: Data = .{};
 
-    const zapi = ZAPI.init(vsapi, core);
+    const zapi = ZAPI.init(vsapi, core, null);
     const map_in = zapi.initZMap(in);
     const map_out = zapi.initZMap(out);
 
@@ -73,6 +98,15 @@ pub fn ssimulacraCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core:
 
     if (vi1.numFrames != vi2.numFrames) {
         map_out.setError(filter_name ++ " : clips must have the same length.");
+        zapi.freeNode(d.node1);
+        zapi.freeNode(d.node2);
+        return;
+    }
+
+    if (((vi1.format.sampleType == .Float) and (vi1.format.bitsPerSample == 16)) or
+        ((vi2.format.sampleType == .Float) and (vi2.format.bitsPerSample == 16)))
+    {
+        map_out.setError(filter_name ++ " : half-float (f16) format is not supported.");
         zapi.freeNode(d.node1);
         zapi.freeNode(d.node2);
         return;
@@ -97,7 +131,7 @@ pub fn ssimulacraCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core:
 
 pub fn sRGBtoLinearRGB(node: ?*vs.Node, zapi: *const ZAPI) ?*vs.Node {
     var in = node;
-    const frame = zapi.getFrame(0, node, null, 0);
+    const frame = zapi.getFrame(0, node, null);
     defer zapi.freeFrame(frame);
 
     const map_in = zapi.initZMap(zapi.getFramePropertiesRO(frame));

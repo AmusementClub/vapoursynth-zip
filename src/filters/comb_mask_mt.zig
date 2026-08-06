@@ -8,11 +8,20 @@ const floor: vec_u8 = @splat(0);
 const peak: vec_u8 = @splat(255);
 const u8_len: vec_i32 = @splat(256);
 
-pub fn process(srcp: []const u8, dstp: []u8, stride: u32, width: u32, height: u32, thresinf: u8, thressup: u8) void {
+pub fn process(
+    srcp: []const u8,
+    dstp: []u8,
+    stride: u32,
+    width: u32,
+    height: u32,
+    thresinf: u8,
+    thressup: u8,
+    thr_diff: u8,
+    comptime same_thr: bool,
+) void {
     const thresinf_v: vec_u8 = @splat(thresinf);
     const thressup_v: vec_u8 = @splat(thressup);
-    const thr_diff: vec_i32 = @splat(thressup - thresinf);
-    const same_thr = thressup == thresinf;
+    const thr_diff_f: @Vector(vec_len, f32) = @splat(@floatFromInt(thr_diff));
 
     var su = srcp;
     var d = dstp;
@@ -30,13 +39,28 @@ pub fn process(srcp: []const u8, dstp: []u8, stride: u32, width: u32, height: u3
             prod = (@as(vec_i32, su[x..][0..vec_len].*) - @as(vec_i32, s[x..][0..vec_len].*)) *
                 (@as(vec_i32, sd[x..][0..vec_len].*) - @as(vec_i32, s[x..][0..vec_len].*));
 
-            const gray: vec_i32 = if (same_thr) floor else @min(((prod - thresinf_v) * u8_len / thr_diff), peak);
-            const sel: vec_i32 = @select(
-                i32,
-                prod < thresinf_v,
-                floor,
-                @select(i32, prod > thressup_v, peak, gray),
-            );
+            // same_thr => thresinf==thressup and gray==floor, so the nested
+            // select collapses to (prod > thressup ? 255 : 0). Bit-identical.
+            const sel: vec_i32 = if (same_thr)
+                @select(i32, prod > thressup_v, peak, floor)
+            else sel: {
+                // f32 division: x86 has no vector integer divide, so the i32
+                // form scalarized to 8x unpipelined idiv (~60 instr/block).
+                // Exact: |dividend| = |prod - thresinf|*256 < 2^24 and
+                // quotient*divisor < 2^24, so the correctly-rounded f32
+                // quotient truncates (@intFromFloat) to the same integer as
+                // @divTrunc for every lane; out-of-window lanes are selected
+                // away below anyway.
+                const num: @Vector(vec_len, f32) = @floatFromInt((prod - thresinf_v) * u8_len);
+                const q: vec_i32 = @intFromFloat(num / thr_diff_f);
+                const gray: vec_i32 = @min(q, peak);
+                break :sel @select(
+                    i32,
+                    prod < thresinf_v,
+                    floor,
+                    @select(i32, prod > thressup_v, peak, gray),
+                );
+            };
 
             d[x..][0..vec_len].* = @as(vec_u8, @intCast(sel));
         }

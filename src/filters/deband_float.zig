@@ -1,0 +1,370 @@
+const std = @import("std");
+const math = std.math;
+const allocator = std.heap.c_allocator;
+
+const hz = @import("../helper.zig");
+const plugin = @import("../vapoursynth/deband.zig");
+const vszip = @import("../vszip.zig");
+const vcl = @import("../vcl.zig");
+
+const vapoursynth = vszip.vapoursynth;
+const vs = vapoursynth.vapoursynth4;
+const vsh = vapoursynth.vshelper;
+const ZAPI = vapoursynth.ZAPI;
+const Mode = plugin.Mode;
+const Data = plugin.Data;
+
+const vec_len = std.simd.suggestVectorLength(f32) orelse 8;
+const i32v = @Vector(vec_len, i32);
+const f32v = @Vector(vec_len, f32);
+const boolv = @Vector(vec_len, bool);
+
+const vec025: f32v = @splat(0.25);
+const vec050: f32v = @splat(0.50);
+const vec200: f32v = @splat(2.00);
+const vec0_f32: f32v = @splat(0.0);
+const vec1_f32: f32v = @splat(1.0);
+const vec2_f32: f32v = @splat(2.0);
+const vec3_f32: f32v = @splat(3.0);
+const vec01_f32: f32v = @splat(0.1);
+const vec05_f32: f32v = @splat(0.5);
+const vec_eps_f32: f32v = @splat(1e-5);
+const vec_pi_f32: f32v = @splat(std.math.pi);
+const vec_scaled_eps: f32v = @splat(0.01 * 3.0);
+
+pub fn F3KDB(comptime mode: Mode, comptime blur_first: bool, comptime add_grain: [3]bool, np: comptime_int) type {
+    return struct {
+        pub fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) ?*const vs.Frame {
+            const d: *Data = @ptrCast(@alignCast(instance_data));
+            const zapi = ZAPI.init(vsapi, core, frame_ctx);
+            if (activation_reason == .Initial) {
+                zapi.requestFrameFilter(n, d.node);
+            } else if (activation_reason == .AllFramesReady) {
+                const src = zapi.initZFrame(d.node, n);
+                defer src.deinit();
+                const dst = src.newVideoFrame();
+
+                inline for (0..np) |plane| {
+                    const src_slice = src.getReadSlice2(f32, plane);
+                    const dst_slice = dst.getWriteSlice2(f32, plane);
+                    const stride = src.getStride(plane) >> 2;
+                    const width = src.getWidth(plane);
+                    const height = src.getHeight(plane);
+                    var grain = if (add_grain[plane]) d.tb.grain_float[plane];
+                    if (add_grain[plane] and d.dynamic_grain) {
+                        const offset = d.tb.grain_offsets[@intCast(n)];
+                        grain = grain[offset..];
+                    }
+
+                    processPlane(
+                        src_slice,
+                        dst_slice,
+                        d.tb.ref1[plane],
+                        d.tb.ref2[plane],
+                        grain,
+                        stride,
+                        width,
+                        height,
+                        d.thr.f[plane],
+                        d.thr1.f[plane],
+                        d.thr2.f[plane],
+                        d.angle_boost,
+                        d.max_angle,
+                        d.pixel_minf[plane],
+                        d.pixel_maxf[plane],
+                        mode,
+                        blur_first,
+                        add_grain[plane],
+                    );
+                }
+
+                return dst.frame;
+            }
+            return null;
+        }
+    };
+}
+
+fn processPlane(
+    src: []const f32,
+    dst: []f32,
+    ref1: []const i32,
+    ref2: []const i32,
+    grain: anytype,
+    stride: u32,
+    width: u32,
+    height: u32,
+    thr: f32,
+    thr1: f32,
+    thr2: f32,
+    angle_boost: f32,
+    max_angle: f32,
+    pixel_min: f32,
+    pixel_max: f32,
+    comptime mode: Mode,
+    comptime blur_first: bool,
+    comptime add_grain: bool,
+) void {
+    const minv: f32v = @splat(pixel_min);
+    const maxv: f32v = @splat(pixel_max);
+    var ref1_arr: [vec_len]f32 align(32) = undefined;
+    var ref2_arr: [vec_len]f32 align(32) = undefined;
+    var ref3_arr: [vec_len]f32 align(32) = undefined;
+    var ref4_arr: [vec_len]f32 align(32) = undefined;
+
+    const thr_32: f32v = @splat(thr);
+    const thr1_32: f32v = @splat(thr1);
+    const thr2_32: f32v = @splat(thr2);
+
+    // Mode 7: precompute the gradient angle once for every (padded) pixel and
+    // turn the 5 per-pixel evaluations (org + 4 ref-offset reads) into cheap
+    // lookups. PAD covers the max |ref offset| (i8-bounded, <=128) so every
+    // offset read lands on a precomputed cell with no clamping — bit-identical
+    // to calculateGradientAngle on the fly (which clamps its own reads).
+    const ANGLE_PAD: u32 = 128;
+    const ang_stride: u32 = if (mode == .m7) hz.ceilN(width + 2 * ANGLE_PAD, hz.vsFrameAlignmentT(@sizeOf(f32))) else 0;
+    const angle_buf: []f32 = if (mode == .m7)
+        (allocator.alloc(f32, (height + 2 * ANGLE_PAD) * ang_stride) catch {
+            var yy: u32 = 0; // graceful passthrough on OOM
+            while (yy < height) : (yy += 1) @memcpy(dst[yy * stride ..][0..width], src[yy * stride ..][0..width]);
+            return;
+        })
+    else
+        &.{};
+    defer if (mode == .m7) allocator.free(angle_buf);
+    if (mode == .m7) fillAnglePlane(src, stride, width, height, angle_buf, ang_stride, ANGLE_PAD);
+
+    var y: u32 = 0;
+    while (y < height) : (y += 1) {
+        const row: u32 = y * stride;
+        const grain_row = if (add_grain) grain[row..];
+        const ref1_row = ref1[row..];
+        const ref2_row = ref2[row..];
+
+        var x: u32 = 0;
+        while (x < width) : (x += vec_len) {
+            var center: f32v = src[row + x ..][0..vec_len].*;
+
+            inline for (0..vec_len) |i| {
+                const base: isize = @intCast(row + x + i);
+                const idx1: isize = ref1_row[x + i];
+                ref1_arr[i] = src[@intCast(base + idx1)];
+                ref3_arr[i] = src[@intCast(base - idx1)];
+            }
+
+            if (mode != .m1 and mode != .m3) {
+                inline for (0..vec_len) |i| {
+                    const base: isize = @intCast(row + x + i);
+                    const idx2: isize = @abs(ref2_row[x + i]);
+                    ref2_arr[i] = src[@intCast(base + idx2)];
+                    ref4_arr[i] = src[@intCast(base - idx2)];
+                }
+            }
+
+            const r1_32: f32v = @bitCast(ref1_arr);
+            const r2_32: f32v = @bitCast(ref2_arr);
+            const r3_32: f32v = @bitCast(ref3_arr);
+            const r4_32: f32v = @bitCast(ref4_arr);
+
+            switch (mode) {
+                .m1, .m3 => {
+                    const avg_32 = (r1_32 + r3_32) * vec050;
+                    const use_original = if (blur_first)
+                        (@abs(avg_32 - center) >= thr_32)
+                    else
+                        (@abs(r1_32 - center) >= thr_32) | (@abs(r3_32 - center) >= thr_32);
+
+                    center = @select(f32, use_original, center, avg_32);
+                },
+                .m2 => {
+                    const avg_32 = (r1_32 + r2_32 + r3_32 + r4_32) * vec025;
+                    const use_original = if (blur_first)
+                        (@abs(avg_32 - center) >= thr_32)
+                    else
+                        ((@abs(r1_32 - center) >= thr_32) |
+                            (@abs(r2_32 - center) >= thr_32) |
+                            (@abs(r3_32 - center) >= thr_32) |
+                            (@abs(r4_32 - center) >= thr_32));
+
+                    center = @select(f32, use_original, center, avg_32);
+                },
+                .m4 => {
+                    const avg_v = (r1_32 + r3_32) * vec050;
+                    const avg_h = (r2_32 + r4_32) * vec050;
+                    const use_orig_v: boolv = if (blur_first)
+                        (@abs(avg_v - center) >= thr_32)
+                    else
+                        ((@abs(r1_32 - center) >= thr_32) | (@abs(r3_32 - center) >= thr_32));
+
+                    const use_orig_h: boolv = if (blur_first)
+                        (@abs(avg_h - center) >= thr_32)
+                    else
+                        ((@abs(r2_32 - center) >= thr_32) | (@abs(r4_32 - center) >= thr_32));
+
+                    const dst_v = @select(f32, use_orig_v, center, avg_v);
+                    const dst_h = @select(f32, use_orig_h, center, avg_h);
+                    center = (dst_v + dst_h) * vec050;
+                },
+                .m5 => {
+                    const avg_32 = (r1_32 + r2_32 + r3_32 + r4_32) * vec025;
+                    const avg_dif = @abs(avg_32 - center);
+                    const d1 = @abs(r1_32 - center);
+                    const d2 = @abs(r2_32 - center);
+                    const d3 = @abs(r3_32 - center);
+                    const d4 = @abs(r4_32 - center);
+                    const max_dif = @max(@max(d1, d2), @max(d3, d4));
+                    const two_src = center * vec200;
+                    const mid_dif1 = @abs((r1_32 + r3_32) - two_src);
+                    const mid_dif2 = @abs((r2_32 + r4_32) - two_src);
+                    const use_original = (avg_dif >= thr_32) |
+                        (max_dif >= thr1_32) |
+                        (mid_dif1 >= thr2_32) |
+                        (mid_dif2 >= thr2_32);
+
+                    center = @select(f32, use_original, center, avg_32);
+                },
+                .m6, .m7 => {
+                    var t_avg: f32v = thr_32;
+                    var t_max: f32v = thr1_32;
+                    var t_mid: f32v = thr2_32;
+
+                    if (mode == .m7) {
+                        const angle_boost_v: f32v = @splat(angle_boost);
+                        const max_angle_v: f32v = @splat(max_angle);
+
+                        const stride_i: i32 = @intCast(stride);
+                        var y_offsets: i32v = undefined;
+                        var x_offsets: i32v = undefined;
+                        inline for (0..vec_len) |i| {
+                            y_offsets[i] = @divTrunc(ref1_row[x + i], stride_i);
+                            x_offsets[i] = ref2_row[x + i];
+                        }
+
+                        const astride_i: i32 = @intCast(ang_stride);
+                        const pad_i: i32 = @intCast(ANGLE_PAD);
+                        const yi: i32 = @intCast(y);
+                        const angle_org: f32v = angle_buf[(y + ANGLE_PAD) * ang_stride + (x + ANGLE_PAD) ..][0..vec_len].*;
+                        var angle_ref1_h: f32v = undefined;
+                        var angle_ref2_h: f32v = undefined;
+                        var angle_ref1_w: f32v = undefined;
+                        var angle_ref2_w: f32v = undefined;
+                        inline for (0..vec_len) |i| {
+                            const bx: i32 = @intCast(x + i);
+                            const yo = y_offsets[i];
+                            const xo = x_offsets[i];
+                            const col: i32 = bx + pad_i;
+                            const row_y: i32 = (yi + pad_i) * astride_i;
+                            angle_ref1_h[i] = angle_buf[@intCast((yi + yo + pad_i) * astride_i + col)];
+                            angle_ref2_h[i] = angle_buf[@intCast((yi - yo + pad_i) * astride_i + col)];
+                            angle_ref1_w[i] = angle_buf[@intCast(row_y + (bx + xo + pad_i))];
+                            angle_ref2_w[i] = angle_buf[@intCast(row_y + (bx - xo + pad_i))];
+                        }
+
+                        var max_angle_diff = @max(@abs(angle_ref1_h - angle_org), @abs(angle_ref2_h - angle_org));
+                        max_angle_diff = @max(max_angle_diff, @max(@abs(angle_ref1_w - angle_org), @abs(angle_ref2_w - angle_org)));
+                        const use_boost: boolv = max_angle_diff <= max_angle_v;
+                        t_avg = @select(f32, use_boost, t_avg * angle_boost_v, t_avg);
+                        t_max = @select(f32, use_boost, t_max * angle_boost_v, t_max);
+                        t_mid = @select(f32, use_boost, t_mid * angle_boost_v, t_mid);
+                    }
+
+                    const p1: f32v = r1_32;
+                    const p2: f32v = r3_32;
+                    const p3: f32v = r2_32;
+                    const p4: f32v = r4_32;
+
+                    const avg_refs: f32v = (p1 + p2 + p3 + p4) * vec025;
+                    const diff_avg_src: f32v = avg_refs - center;
+                    const avg_dif: f32v = @abs(diff_avg_src);
+
+                    const d1: f32v = @abs(p1 - center);
+                    const d2: f32v = @abs(p2 - center);
+                    const d3: f32v = @abs(p3 - center);
+                    const d4: f32v = @abs(p4 - center);
+                    const max_dif: f32v = @max(@max(d1, d2), @max(d3, d4));
+
+                    const two_src: f32v = center * vec2_f32;
+                    const mid_dif_v: f32v = @abs((p1 + p2) - two_src);
+                    const mid_dif_h: f32v = @abs((p3 + p4) - two_src);
+
+                    const comp_avg: f32v = saturate(vec3_f32 * (vec1_f32 - avg_dif / @max(t_avg, vec_eps_f32)));
+                    const comp_max: f32v = saturate(vec3_f32 * (vec1_f32 - max_dif / @max(t_max, vec_eps_f32)));
+                    const comp_mid_v: f32v = saturate(vec3_f32 * (vec1_f32 - mid_dif_v / @max(t_mid, vec_eps_f32)));
+                    const comp_mid_h: f32v = saturate(vec3_f32 * (vec1_f32 - mid_dif_h / @max(t_mid, vec_eps_f32)));
+
+                    const product: f32v = comp_avg * comp_max * comp_mid_v * comp_mid_h;
+                    const factor: f32v = vcl.pow(product, vec01_f32);
+                    center = center + diff_avg_src * factor;
+                },
+            }
+
+            if (add_grain) {
+                center += @as(f32v, grain_row[x..][0..vec_len].*);
+            }
+
+            center = @max(minv, @min(center, maxv));
+            dst[row + x ..][0..vec_len].* = center;
+        }
+    }
+}
+
+fn saturate(x: f32v) f32v {
+    return @max(vec0_f32, @min(x, vec1_f32));
+}
+
+/// Precompute the gradient angle for every padded pixel: the angle for source
+/// coordinate (Y,X) lives at buf[(Y+PAD)*ang_stride + (X+PAD)]. Uses the exact
+/// same calculateGradientAngle as the per-pixel path (which clamps its own
+/// neighbour reads), so a lookup is bit-identical to recomputing on the fly.
+fn fillAnglePlane(src: []const f32, stride: u32, width: u32, height: u32, buf: []f32, ang_stride: u32, comptime PAD: u32) void {
+    const padded_w = width + 2 * PAD;
+    const padded_h = height + 2 * PAD;
+    var yy: u32 = 0;
+    while (yy < padded_h) : (yy += 1) {
+        const yc: i32v = @splat(@as(i32, @intCast(yy)) - @as(i32, @intCast(PAD)));
+        const row = yy * ang_stride;
+        var xx: u32 = 0;
+        while (xx < padded_w) : (xx += vec_len) {
+            var xc: i32v = undefined;
+            inline for (0..vec_len) |i| {
+                xc[i] = @as(i32, @intCast(xx + i)) - @as(i32, @intCast(PAD));
+            }
+            buf[row + xx ..][0..vec_len].* = calculateGradientAngle(src, stride, width, height, yc, xc, 20);
+        }
+    }
+}
+
+fn gatherPixelValues(src: []const f32, stride: u32, width: u32, height: u32, y_coords: i32v, x_coords: i32v) f32v {
+    const width_i: i32v = @splat(@intCast(width - 1));
+    const height_i: i32v = @splat(@intCast(height - 1));
+    const stride_i: i32v = @splat(@intCast(stride));
+    const zero_i: i32v = @splat(0);
+    const clamped_y = @max(zero_i, @min(y_coords, height_i));
+    const clamped_x = @max(zero_i, @min(x_coords, width_i));
+    const offsets: @Vector(vec_len, u32) = @intCast(clamped_y * stride_i + clamped_x);
+
+    var result_arr: [vec_len]f32 align(32) = undefined;
+    inline for (0..vec_len) |i| {
+        result_arr[i] = src[offsets[i]];
+    }
+    return result_arr;
+}
+
+fn calculateGradientAngle(src: []const f32, stride: u32, width: u32, height: u32, y_coords: i32v, x_coords: i32v, read_distance: comptime_int) f32v {
+    const rd: i32v = @splat(read_distance);
+    const p00 = gatherPixelValues(src, stride, width, height, y_coords - rd, x_coords - rd);
+    const p10 = gatherPixelValues(src, stride, width, height, y_coords - rd, x_coords);
+    const p20 = gatherPixelValues(src, stride, width, height, y_coords - rd, x_coords + rd);
+    const p01 = gatherPixelValues(src, stride, width, height, y_coords, x_coords - rd);
+    const p21 = gatherPixelValues(src, stride, width, height, y_coords, x_coords + rd);
+    const p02 = gatherPixelValues(src, stride, width, height, y_coords + rd, x_coords - rd);
+    const p12 = gatherPixelValues(src, stride, width, height, y_coords + rd, x_coords);
+    const p22 = gatherPixelValues(src, stride, width, height, y_coords + rd, x_coords + rd);
+
+    const gx = (p20 + vec2_f32 * p21 + p22) - (p00 + vec2_f32 * p01 + p02);
+    const gy = (p00 + vec2_f32 * p10 + p20) - (p02 + vec2_f32 * p12 + p22);
+    const gx_is_small: boolv = @abs(gx) < vec_scaled_eps;
+    const angle_raw = vcl.atan(gy / gx);
+    const angle_normalized = angle_raw / vec_pi_f32 + vec05_f32;
+    return @select(f32, gx_is_small, vec1_f32, angle_normalized);
+}

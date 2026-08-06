@@ -29,16 +29,16 @@ const StringProp = struct {
 
 fn PlaneAverage(comptime T: type, comptime refb: bool) type {
     return struct {
-        pub fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) ?*const vs.Frame {
+        pub fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) ?*const vs.Frame {
             const d: *Data = @ptrCast(@alignCast(instance_data));
-            const zapi = ZAPI.init(vsapi, core);
+            const zapi = ZAPI.init(vsapi, core, frame_ctx);
 
             if (activation_reason == .Initial) {
-                zapi.requestFrameFilter(n, d.node1, frame_ctx);
-                if (refb) zapi.requestFrameFilter(n, d.node2, frame_ctx);
+                zapi.requestFrameFilter(n, d.node1);
+                if (refb) zapi.requestFrameFilter(n, d.node2);
             } else if (activation_reason == .AllFramesReady) {
-                const src = zapi.initZFrame(d.node1, n, frame_ctx);
-                const ref = if (refb) zapi.initZFrame(d.node2, n, frame_ctx);
+                const src = zapi.initZFrame(d.node1, n);
+                const ref = if (refb) zapi.initZFrame(d.node2, n);
                 const dst = src.copyFrame();
                 const props = dst.getPropertiesRW();
                 props.deleteKey(d.prop.d);
@@ -75,9 +75,9 @@ fn PlaneAverage(comptime T: type, comptime refb: bool) type {
     };
 }
 
-fn planeAverageFree(instance_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) void {
+fn planeAverageFree(instance_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     const d: *Data = @ptrCast(@alignCast(instance_data));
-    const zapi = ZAPI.init(vsapi, core);
+    const zapi = ZAPI.init(vsapi, core, null);
 
     switch (d.exclude) {
         .i => allocator.free(d.exclude.i),
@@ -92,10 +92,10 @@ fn planeAverageFree(instance_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const 
     allocator.destroy(d);
 }
 
-pub fn planeAverageCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) void {
+pub fn planeAverageCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     var d: Data = .{};
 
-    const zapi = ZAPI.init(vsapi, core);
+    const zapi = ZAPI.init(vsapi, core, null);
     const map_in = zapi.initZMap(in);
     const map_out = zapi.initZMap(out);
     d.node1, d.vi = map_in.getNodeVi("clipa").?;
@@ -113,8 +113,8 @@ pub fn planeAverageCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, cor
 
     const prop_in = map_in.getData("prop", 0) orelse "psm";
     d.prop = .{
-        .d = std.fmt.allocPrintZ(allocator, "{s}Diff", .{prop_in}) catch unreachable,
-        .a = std.fmt.allocPrintZ(allocator, "{s}Avg", .{prop_in}) catch unreachable,
+        .d = std.fmt.allocPrintSentinel(allocator, "{s}Diff", .{prop_in}, 0) catch unreachable,
+        .a = std.fmt.allocPrintSentinel(allocator, "{s}Avg", .{prop_in}, 0) catch unreachable,
     };
 
     const exclude_in = map_in.getIntArray("exclude");
@@ -124,10 +124,31 @@ pub fn planeAverageCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, cor
             for (d.exclude.f, ein) |*df, *ei| {
                 df.* = @floatFromInt(ei.*);
             }
+        } else if (dt == .U32) {
+            map_out.setError(filter_name ++ ": exclude is not supported for 32-bit integer clips.");
+            allocator.free(d.prop.d);
+            allocator.free(d.prop.a);
+            if (d.node2) |node| zapi.freeNode(node);
+            zapi.freeNode(d.node1);
+            return;
         } else {
-            d.exclude = filter.Exclude{ .i = allocator.alloc(i32, ein.len) catch unreachable };
-            for (d.exclude.i, ein) |*di, *ei| {
-                di.* = math.lossyCast(i32, ei.*);
+            // The kernels compare the i32-widened pixel against i32 excludes,
+            // so a value outside T's storage range can never match — strip
+            // them here (the conventional never-match sentinel is
+            // exclude=[-1]) so getFrame takes the compare-free fast path on
+            // an empty slice.
+            const tmax: i64 = if (dt == .U8) math.maxInt(u8) else math.maxInt(u16);
+            var m: usize = 0;
+            for (ein) |e| {
+                if (e >= 0 and e <= tmax) m += 1;
+            }
+            d.exclude = filter.Exclude{ .i = allocator.alloc(i32, m) catch unreachable };
+            var idx: usize = 0;
+            for (ein) |e| {
+                if (e >= 0 and e <= tmax) {
+                    d.exclude.i[idx] = @intCast(e);
+                    idx += 1;
+                }
             }
         }
     }
@@ -141,13 +162,7 @@ pub fn planeAverageCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, cor
         .{ .source = d.node2, .requestPattern = rp2 },
     };
 
-    const gf: vs.FilterGetFrame = switch (dt) {
-        .U8 => if (refb) &PlaneAverage(u8, true).getFrame else &PlaneAverage(u8, false).getFrame,
-        .U16 => if (refb) &PlaneAverage(u16, true).getFrame else &PlaneAverage(u16, false).getFrame,
-        .U32 => if (refb) &PlaneAverage(u32, true).getFrame else &PlaneAverage(u32, false).getFrame,
-        .F16 => if (refb) &PlaneAverage(f16, true).getFrame else &PlaneAverage(f16, false).getFrame,
-        .F32 => if (refb) &PlaneAverage(f32, true).getFrame else &PlaneAverage(f32, false).getFrame,
-    };
+    const gf: vs.FilterGetFrame = hz.selectRefFilter(PlaneAverage, dt, refb, true);
 
     const ndeps: usize = if (refb) 2 else 1;
     zapi.createVideoFilter(out, filter_name, d.vi, gf, planeAverageFree, .Parallel, deps[0..ndeps], data);

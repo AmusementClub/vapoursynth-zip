@@ -16,47 +16,62 @@ const Data = struct {
     vi: *const vs.VideoInfo = undefined,
     thy1: u8 = 0,
     thy2: u8 = 0,
+    thr_diff: u8 = 0,
 };
 
-fn combMaskMTGetFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) ?*const vs.Frame {
-    const d: *Data = @ptrCast(@alignCast(instance_data));
-    const zapi = ZAPI.init(vsapi, core);
+fn CombMaskMT(comptime same_thr: bool) type {
+    return struct {
+        pub fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) ?*const vs.Frame {
+            const d: *Data = @ptrCast(@alignCast(instance_data));
+            const zapi = ZAPI.init(vsapi, core, frame_ctx);
 
-    if (activation_reason == .Initial) {
-        zapi.requestFrameFilter(n, d.node, frame_ctx);
-    } else if (activation_reason == .AllFramesReady) {
-        const src = zapi.initZFrame(d.node, n, frame_ctx);
+            if (activation_reason == .Initial) {
+                zapi.requestFrameFilter(n, d.node);
+            } else if (activation_reason == .AllFramesReady) {
+                const src = zapi.initZFrame(d.node, n);
 
-        defer src.deinit();
+                defer src.deinit();
 
-        const dst = src.newVideoFrame();
+                const dst = src.newVideoFrame();
 
-        var plane: u32 = 0;
-        while (plane < d.vi.format.numPlanes) : (plane += 1) {
-            const srcp = src.getReadSlice(plane);
-            const dstp = dst.getWriteSlice(plane);
-            const w, const h, const stride = src.getDimensions(plane);
-            filter.process(srcp, dstp, stride, w, h, d.thy1, d.thy2);
+                var plane: u32 = 0;
+                while (plane < d.vi.format.numPlanes) : (plane += 1) {
+                    const srcp = src.getReadSlice(plane);
+                    const dstp = dst.getWriteSlice(plane);
+                    const w, const h, const stride = src.getDimensions(plane);
+                    filter.process(
+                        srcp,
+                        dstp,
+                        stride,
+                        w,
+                        h,
+                        d.thy1,
+                        d.thy2,
+                        d.thr_diff,
+                        same_thr,
+                    );
+                }
+
+                return dst.frame;
+            }
+
+            return null;
         }
-
-        return dst.frame;
-    }
-
-    return null;
+    };
 }
 
-fn combMaskMTFree(instance_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) void {
+fn combMaskMTFree(instance_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     const d: *Data = @ptrCast(@alignCast(instance_data));
-    const zapi = ZAPI.init(vsapi, core);
+    const zapi = ZAPI.init(vsapi, core, null);
 
     zapi.freeNode(d.node);
     allocator.destroy(d);
 }
 
-pub fn combMaskMTCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) void {
+pub fn combMaskMTCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     var d: Data = .{};
 
-    const zapi = ZAPI.init(vsapi, core);
+    const zapi = ZAPI.init(vsapi, core, null);
     const map_in = zapi.initZMap(in);
     const map_out = zapi.initZMap(out);
     d.node, d.vi = map_in.getNodeVi("clip").?;
@@ -87,8 +102,16 @@ pub fn combMaskMTCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core:
         return;
     }
 
+    const min_h: u32 = @as(u32, @intCast(d.vi.height)) >> @as(u5, @intCast(d.vi.format.subSamplingH));
+    if (min_h < 3) {
+        map_out.setError(filter_name ++ ": clip too small; every plane must be at least 3 rows tall.");
+        zapi.freeNode(d.node);
+        return;
+    }
+
     d.thy1 = @intCast(thy1);
     d.thy2 = @intCast(thy2);
+    d.thr_diff = d.thy2 - d.thy1;
 
     const data: *Data = allocator.create(Data) catch unreachable;
     data.* = d;
@@ -97,5 +120,6 @@ pub fn combMaskMTCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core:
         .{ .source = d.node, .requestPattern = .StrictSpatial },
     };
 
-    zapi.createVideoFilter(out, filter_name, d.vi, combMaskMTGetFrame, combMaskMTFree, .Parallel, &deps, data);
+    const gf: vs.FilterGetFrame = if (d.thy1 == d.thy2) &CombMaskMT(true).getFrame else &CombMaskMT(false).getFrame;
+    zapi.createVideoFilter(out, filter_name, d.vi, gf, combMaskMTFree, .Parallel, &deps, data);
 }

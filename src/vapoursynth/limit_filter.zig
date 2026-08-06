@@ -26,19 +26,19 @@ const Data = struct {
 
 fn LimitFilter(comptime T: type, comptime refb: bool) type {
     return struct {
-        pub fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) ?*const vs.Frame {
+        pub fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) ?*const vs.Frame {
             const d: *Data = @ptrCast(@alignCast(instance_data));
-            const zapi = ZAPI.init(vsapi, core);
+            const zapi = ZAPI.init(vsapi, core, frame_ctx);
 
             if (activation_reason == .Initial) {
-                zapi.requestFrameFilter(n, d.flt, frame_ctx);
-                zapi.requestFrameFilter(n, d.src, frame_ctx);
-                if (refb) zapi.requestFrameFilter(n, d.ref, frame_ctx);
+                zapi.requestFrameFilter(n, d.flt);
+                zapi.requestFrameFilter(n, d.src);
+                if (refb) zapi.requestFrameFilter(n, d.ref);
             } else if (activation_reason == .AllFramesReady) {
-                const src = zapi.initZFrame(d.src, n, frame_ctx);
-                const flt = zapi.initZFrame(d.flt, n, frame_ctx);
-                const ref = if (refb) zapi.initZFrame(d.ref, n, frame_ctx);
-                const dst = src.newVideoFrame2(d.planes);
+                const src = zapi.initZFrame(d.src, n);
+                const flt = zapi.initZFrame(d.flt, n);
+                const ref = if (refb) zapi.initZFrame(d.ref, n);
+                const dst = flt.newVideoFrame2(d.planes);
 
                 var plane: u32 = 0;
                 while (plane < d.vi.format.numPlanes) : (plane += 1) {
@@ -72,9 +72,9 @@ fn LimitFilter(comptime T: type, comptime refb: bool) type {
     };
 }
 
-fn limitFilterFree(instance_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) void {
+fn limitFilterFree(instance_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     const d: *Data = @ptrCast(@alignCast(instance_data));
-    const zapi = ZAPI.init(vsapi, core);
+    const zapi = ZAPI.init(vsapi, core, null);
 
     zapi.freeNode(d.flt);
     zapi.freeNode(d.src);
@@ -82,10 +82,10 @@ fn limitFilterFree(instance_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const v
     allocator.destroy(d);
 }
 
-pub fn limitFilterCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) void {
+pub fn limitFilterCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     var d: Data = .{};
 
-    const zapi = ZAPI.init(vsapi, core);
+    const zapi = ZAPI.init(vsapi, core, null);
     const map_in = zapi.initZMap(in);
     const map_out = zapi.initZMap(out);
 
@@ -104,6 +104,7 @@ pub fn limitFilterCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core
     d.elast = hz.getArray(f32, 2, 0, math.maxInt(u16), "elast", filter_name, map_in, map_out, &nodes, &zapi) catch return;
 
     for (0..3) |i| {
+        // TODO: check if scale is correct
         d.dark_thr[i] = hz.scaleValue(d.dark_thr[i], d.flt, &zapi, .{});
         d.bright_thr[i] = hz.scaleValue(d.bright_thr[i], d.flt, &zapi, .{});
     }
@@ -117,13 +118,7 @@ pub fn limitFilterCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core
         .{ .source = d.ref, .requestPattern = .StrictSpatial },
     };
 
-    const gf: vs.FilterGetFrame = switch (dt) {
-        .U8 => if (refb) &LimitFilter(u8, true).getFrame else &LimitFilter(u8, false).getFrame,
-        .U16 => if (refb) &LimitFilter(u16, true).getFrame else &LimitFilter(u16, false).getFrame,
-        .F16 => if (refb) &LimitFilter(f16, true).getFrame else &LimitFilter(f16, false).getFrame,
-        .F32 => if (refb) &LimitFilter(f32, true).getFrame else &LimitFilter(f32, false).getFrame,
-        .U32 => unreachable,
-    };
+    const gf: vs.FilterGetFrame = hz.selectRefFilter(LimitFilter, dt, refb, false);
 
     const deps_len: usize = if (refb) deps.len else (deps.len - 1);
     zapi.createVideoFilter(out, filter_name, d.vi, gf, limitFilterFree, .Parallel, deps[0..deps_len], data);

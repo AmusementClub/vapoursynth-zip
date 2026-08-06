@@ -15,17 +15,17 @@ pub const filter_name = "ColorMap";
 const Data = struct {
     node: ?*vs.Node = null,
     vi: vs.VideoInfo = .{},
-    color: [3][256]u8 = .{.{0} ** 256} ** 3,
+    color: [3][256]u8 = .{ @splat(0), @splat(0), @splat(0) },
 };
 
-fn colorMapGetFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) ?*const vs.Frame {
+fn colorMapGetFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) ?*const vs.Frame {
     const d: *Data = @ptrCast(@alignCast(instance_data));
-    const zapi = ZAPI.init(vsapi, core);
+    const zapi = ZAPI.init(vsapi, core, frame_ctx);
 
     if (activation_reason == .Initial) {
-        zapi.requestFrameFilter(n, d.node, frame_ctx);
+        zapi.requestFrameFilter(n, d.node);
     } else if (activation_reason == .AllFramesReady) {
-        const src = zapi.initZFrame(d.node, n, frame_ctx);
+        const src = zapi.initZFrame(d.node, n);
         defer src.deinit();
 
         const dst = src.newVideoFrame3(.{ .format = &d.vi.format });
@@ -33,10 +33,10 @@ fn colorMapGetFrame(n: c_int, activation_reason: vs.ActivationReason, instance_d
         const srcp = src.getReadSlice(0);
         const dstp = dst.getWriteSlices();
 
-        var x: u32 = 0;
-        while (x < w) : (x += 1) {
-            var y: u32 = 0;
-            while (y < h) : (y += 1) {
+        var y: u32 = 0;
+        while (y < h) : (y += 1) {
+            var x: u32 = 0;
+            while (x < w) : (x += 1) {
                 const idx: u32 = y * stride + x;
                 const s: u8 = srcp[idx];
                 dstp[0][idx] = d.color[0][s];
@@ -45,24 +45,29 @@ fn colorMapGetFrame(n: c_int, activation_reason: vs.ActivationReason, instance_d
             }
         }
 
-        dst.getPropertiesRW().setColorRange(.FULL);
+        const props = dst.getPropertiesRW();
+        props.setMatrix(.RGB);
+        props.setTransfer(.IEC_61966_2_1);
+        props.setPrimaries(.BT709);
+        props.setColorRange(.FULL);
+
         return dst.frame;
     }
 
     return null;
 }
 
-fn colorMapFree(instance_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) void {
+fn colorMapFree(instance_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     const d: *Data = @ptrCast(@alignCast(instance_data));
-    const zapi = ZAPI.init(vsapi, core);
+    const zapi = ZAPI.init(vsapi, core, null);
 
     zapi.freeNode(d.node);
     allocator.destroy(d);
 }
 
-pub fn colorMapCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) void {
+pub fn colorMapCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     var d: Data = .{};
-    const zapi = ZAPI.init(vsapi, core);
+    const zapi = ZAPI.init(vsapi, core, null);
     const map_in = zapi.initZMap(in);
     const map_out = zapi.initZMap(out);
 
@@ -84,11 +89,17 @@ pub fn colorMapCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?
     const color: Colors = @enumFromInt(icolor);
     const color_arr = color.getColor();
 
+    const len: usize = color_arr[0].len;
+    const lenm1: f32 = @floatFromInt(len - 1);
     for (0..256) |i| {
-        const j: usize = color_arr[0].len * i / 256;
-        d.color[0][i] = @intFromFloat(@mulAdd(f32, color_arr[0][j], 255, 0.5));
-        d.color[1][i] = @intFromFloat(@mulAdd(f32, color_arr[1][j], 255, 0.5));
-        d.color[2][i] = @intFromFloat(@mulAdd(f32, color_arr[2][j], 255, 0.5));
+        const p: f32 = @as(f32, @floatFromInt(i)) * lenm1 / 255.0;
+        const lo: usize = @intFromFloat(@floor(p));
+        const hi: usize = @min(lo + 1, len - 1);
+        const frac: f32 = p - @as(f32, @floatFromInt(lo));
+        inline for (0..3) |c| {
+            const v: f32 = color_arr[c][lo] + (color_arr[c][hi] - color_arr[c][lo]) * frac;
+            d.color[c][i] = @trunc(@mulAdd(f32, v, 255, 0.5));
+        }
     }
 
     d.vi = in_vi.*;

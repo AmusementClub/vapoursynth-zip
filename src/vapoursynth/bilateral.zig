@@ -32,24 +32,21 @@ pub const Data = struct {
 
 fn Bilateral(comptime T: type, comptime join: bool) type {
     return struct {
-        pub fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) ?*const vs.Frame {
+        pub fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) ?*const vs.Frame {
             const d: *Data = @ptrCast(@alignCast(instance_data));
-            const zapi = ZAPI.init(vsapi, core);
+            const zapi = ZAPI.init(vsapi, core, frame_ctx);
 
             if (activation_reason == .Initial) {
-                zapi.requestFrameFilter(n, d.node1, frame_ctx);
+                zapi.requestFrameFilter(n, d.node1);
                 if (join) {
-                    zapi.requestFrameFilter(n, d.node2, frame_ctx);
+                    zapi.requestFrameFilter(n, d.node2);
                 }
             } else if (activation_reason == .AllFramesReady) {
-                const src = zapi.initZFrame(d.node1, n, frame_ctx);
+                const src = zapi.initZFrame(d.node1, n);
                 defer src.deinit();
 
-                var ref = src;
-                if (join) {
-                    ref = zapi.initZFrame(d.node2, n, frame_ctx);
-                    defer ref.deinit();
-                }
+                const ref = if (join) zapi.initZFrame(d.node2, n) else src;
+                defer if (join) ref.deinit();
 
                 const dst = src.newVideoFrame2(d.planes);
                 var plane: u32 = 0;
@@ -71,9 +68,9 @@ fn Bilateral(comptime T: type, comptime join: bool) type {
     };
 }
 
-fn bilateralFree(instance_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) void {
+fn bilateralFree(instance_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     const d: *Data = @ptrCast(@alignCast(instance_data));
-    const zapi = ZAPI.init(vsapi, core);
+    const zapi = ZAPI.init(vsapi, core, null);
 
     var i: u32 = 0;
     while (i < 3) : (i += 1) {
@@ -91,10 +88,10 @@ fn bilateralFree(instance_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.
     allocator.destroy(d);
 }
 
-pub fn bilateralCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) void {
+pub fn bilateralCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     var d: Data = .{};
 
-    const zapi = ZAPI.init(vsapi, core);
+    const zapi = ZAPI.init(vsapi, core, null);
     const map_in = zapi.initZMap(in);
     const map_out = zapi.initZMap(out);
     d.node1, d.vi = map_in.getNodeVi("clip").?;
@@ -113,9 +110,9 @@ pub fn bilateralCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: 
             d.sigmaS[i] = map_in.getFloat2(f64, "sigmaS", i).?;
         } else if (i == 0) {
             d.sigmaS[0] = 3;
-        } else if ((i == 1) and (yuv) and (ssh == 1) and (ssw == 1)) {
-            const j: f64 = @floatFromInt((ssh + 1) * (ssw + 1));
-            d.sigmaS[1] = d.sigmaS[0] / @sqrt(j);
+        } else if ((i == 1) and yuv and (ssh != 0) and (ssw != 0)) {
+            const factor: f64 = @floatFromInt((@as(u32, 1) << @intCast(ssh)) * (@as(u32, 1) << @intCast(ssw)));
+            d.sigmaS[1] = d.sigmaS[0] / @sqrt(factor);
         } else {
             d.sigmaS[i] = d.sigmaS[i - 1];
         }
@@ -153,9 +150,9 @@ pub fn bilateralCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: 
             if (d.sigmaR[i] >= 0.08) {
                 d.PBFICnum[i] = 4;
             } else if (d.sigmaR[i] >= 0.015) {
-                d.PBFICnum[i] = @min(16, @as(u32, @intFromFloat(4 * 0.08 / d.sigmaR[i] + 0.5)));
+                d.PBFICnum[i] = @min(16, @as(u32, @trunc(4 * 0.08 / d.sigmaR[i] + 0.5)));
             } else {
-                d.PBFICnum[i] = @min(32, @as(u32, @intFromFloat(16 * 0.015 / d.sigmaR[i] + 0.5)));
+                d.PBFICnum[i] = @min(32, @as(u32, @trunc(16 * 0.015 / d.sigmaR[i] + 0.5)));
             }
 
             if ((i > 0) and yuv and (d.PBFICnum[i] % 2 == 0) and (d.PBFICnum[i] < 256)) {
@@ -168,7 +165,7 @@ pub fn bilateralCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: 
     var orad = [_]i32{ 0, 0, 0 };
     while (i < 3) : (i += 1) {
         if (d.planes[i]) {
-            orad[i] = @max(@as(i32, @intFromFloat(d.sigmaS[i] * 2 + 0.5)), 1);
+            orad[i] = @max(@as(i32, @trunc(d.sigmaS[i] * 2 + 0.5)), 1);
             if (orad[i] < 4) {
                 d.step[i] = 1;
             } else if (orad[i] < 8) {
@@ -197,6 +194,21 @@ pub fn bilateralCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: 
         if (d.planes[i]) {
             if (d.algorithm[i] <= 0) {
                 d.algorithm[i] = if (d.step[i] == 1) 2 else (if ((d.sigmaR[i] < 0.08) and (d.samples[i] < 5)) 2 else (if (4 * d.samples[i] * d.samples[i] <= 15 * d.PBFICnum[i]) 2 else 1));
+            }
+        }
+    }
+
+    i = 0;
+    while (i < 3) : (i += 1) {
+        if ((d.planes[i]) and (d.algorithm[i] == 2)) {
+            const sw: u5 = if (i == 0) 0 else @intCast(d.vi.format.subSamplingW);
+            const sh: u5 = if (i == 0) 0 else @intCast(d.vi.format.subSamplingH);
+            const pw: u32 = @as(u32, @intCast(d.vi.width)) >> sw;
+            const ph: u32 = @as(u32, @intCast(d.vi.height)) >> sh;
+            if ((pw <= 2 * d.radius[i]) or (ph <= 2 * d.radius[i])) {
+                map_out.setError("Bilateral: plane too small for the spatial radius derived from sigmaS; lower sigmaS or use a larger clip.");
+                zapi.freeNode(d.node1);
+                return;
             }
         }
     }
@@ -234,13 +246,7 @@ pub fn bilateralCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: 
         .{ .source = d.node2, .requestPattern = rp2 },
     };
 
-    const getFrame = switch (dt) {
-        .U8 => if (refb) &Bilateral(u8, true).getFrame else &Bilateral(u8, false).getFrame,
-        .U16 => if (refb) &Bilateral(u16, true).getFrame else &Bilateral(u16, false).getFrame,
-        .F16 => if (refb) &Bilateral(f16, true).getFrame else &Bilateral(f16, false).getFrame,
-        .F32 => if (refb) &Bilateral(f32, true).getFrame else &Bilateral(f32, false).getFrame,
-        .U32 => unreachable,
-    };
+    const getFrame = hz.selectRefFilter(Bilateral, dt, refb, false);
 
     const ndeps: usize = if (refb) 2 else 1;
     zapi.createVideoFilter(out, filter_name, d.vi, getFrame, bilateralFree, .Parallel, deps[0..ndeps], data);

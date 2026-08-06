@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const math = std.math;
 
 const vszip = @import("vszip.zig");
@@ -94,7 +95,31 @@ pub const DataType = enum {
             }
         }
     }
+
+    pub fn ToType(comptime self: DataType) type {
+        return switch (self) {
+            .U8 => u8,
+            .U16 => u16,
+            .U32 => u32,
+            .F16 => f16,
+            .F32 => f32,
+        };
+    }
 };
+
+pub fn selectRefFilter(
+    comptime Filter: fn (comptime type, comptime bool) type,
+    dt: DataType,
+    refb: bool,
+    comptime enable_u32: bool,
+) vs.FilterGetFrame {
+    return switch (dt) {
+        inline else => |tag| if (comptime tag == .U32 and !enable_u32) unreachable else blk: {
+            const T = comptime tag.ToType();
+            break :blk if (refb) &Filter(T, true).getFrame else &Filter(T, false).getFrame;
+        },
+    };
+}
 
 pub fn absDiff(x: anytype, y: anytype) @TypeOf(x) {
     return if (x > y) (x - y) else (y - x);
@@ -234,7 +259,7 @@ pub fn getVal2(comptime T: type, ptr: anytype, x: u32, y: u32) T {
 }
 
 pub fn getColorRange(node: *vs.Node, zapi: *const ZAPI) vsc.ColorRange {
-    const frame = zapi.getFrame(0, node, null, 0);
+    const frame = zapi.getFrame(0, node, null);
     defer zapi.freeFrame(frame);
 
     if (frame) |f| {
@@ -335,6 +360,15 @@ pub fn getArray(
 
     var array: [3]T = undefined;
     const len = in.numElements(key) orelse 0;
+    if (len > 3) {
+        err_msg = std.fmt.allocPrintSentinel(
+            allocator,
+            "{s}: {s} has too many elements (got {d}, max 3).",
+            .{ filter_name, key, len },
+            0,
+        ) catch return error.outOfMemory;
+        return error.invalidArgument;
+    }
     var i: u8 = 0;
     while (i < 3) : (i += 1) {
         if (i < len) {
@@ -346,23 +380,184 @@ pub fn getArray(
         }
 
         if (array[i] < min) {
-            err_msg = std.fmt.allocPrintZ(
+            err_msg = std.fmt.allocPrintSentinel(
                 allocator,
                 "{s}: {s} value {d} is below minimum {d}.",
                 .{ filter_name, key, array[i], min },
+                0,
             ) catch return error.outOfMemory;
             return error.invalidArgument;
         }
 
         if (array[i] > max) {
-            err_msg = std.fmt.allocPrintZ(
+            err_msg = std.fmt.allocPrintSentinel(
                 allocator,
                 "{s}: {s} value {d} is above maximum {d}.",
                 .{ filter_name, key, array[i], max },
+                0,
             ) catch return error.outOfMemory;
             return error.invalidArgument;
         }
     }
 
     return array;
+}
+
+pub const Maps = struct {
+    in: *const ZAPI.ZMap(?*const vs.Map),
+    out: *const ZAPI.ZMap(?*vs.Map),
+    name: [:0]const u8,
+
+    pub fn init(zin: *const ZAPI.ZMap(?*const vs.Map), zout: *const ZAPI.ZMap(?*vs.Map), filter_name: [:0]const u8) Maps {
+        return Maps{
+            .in = zin,
+            .out = zout,
+            .name = filter_name,
+        };
+    }
+
+    pub fn getValue(self: *const Maps, comptime T: type, comptime key: [:0]const u8, default: T, min: T, max: T) !T {
+        const is_int = @typeInfo(T) == .int;
+        const T2 = if (is_int) i64 else f64;
+        const val: T2 = self.in.getValue(T2, key) orelse default;
+        if (val < min or val > max) {
+            self.out.setError2("{s}: parameter \"{s}={d}\" out of range [{d}..{d}].", .{ self.name, key, val, min, max });
+            return error.ParameterOutOfRange;
+        }
+
+        return if (is_int) @intCast(val) else @floatCast(val);
+    }
+
+    pub fn getArray(self: *const Maps, comptime key: [:0]const u8, max_len: comptime_int, default: [3]f64, min: f64, max: f64) ![3]f64 {
+        if (self.in.getFloatArray(key)) |a| {
+            if (a.len > max_len) {
+                self.out.setError2("{s}: parameter \"{s}\" has too many elements (got {d}, max {d}).", .{ self.name, key, a.len, max_len });
+                return error.ParameterOutOfRange;
+            }
+            var out: [3]f64 = undefined;
+            for (0..3) |i| {
+                const val = a[@min(i, a.len - 1)];
+                if (val < min or val > max) {
+                    self.out.setError2("{s}: parameter \"{s}[{d}]={d}\" out of range [{d}..{d}].", .{ self.name, key, i, val, min, max });
+                    return error.ParameterOutOfRange;
+                }
+
+                out[i] = val;
+            }
+            return out;
+        }
+
+        return default;
+    }
+};
+
+pub const ditherType = enum {
+    none,
+    ordered,
+    random,
+    error_diffusion,
+
+    pub fn toString(self: ditherType) [:0]const u8 {
+        return switch (self) {
+            .none => "none",
+            .ordered => "ordered",
+            .random => "random",
+            .error_diffusion => "error_diffusion",
+        };
+    }
+};
+
+pub fn bitDepth(bitdepth: u32, node: *vs.Node, dither: ditherType, zapi: *const ZAPI) *vs.Node {
+    const vf = zapi.getVideoInfo(node).format;
+    if (vf.bitsPerSample == bitdepth) {
+        return node;
+    }
+
+    const vf_out = vs.makeVideoID(
+        vf.colorFamily,
+        vf.sampleType,
+        bitdepth,
+        @intCast(vf.subSamplingW),
+        @intCast(vf.subSamplingH),
+    );
+
+    const args = zapi.createZMap();
+    _ = args.consumeNode("clip", node, .Replace);
+    args.setInt("format", vf_out, .Replace);
+    args.setData("dither_type", dither.toString(), .Utf8, .Replace);
+    const vsplugin = zapi.getPluginByID2(.Resize);
+    const ret = args.invoke(vsplugin, "Point");
+    const out = ret.getNode("clip").?;
+    ret.free();
+    args.free();
+    return out;
+}
+
+/// [luma, chroma] stride
+pub fn strideFromVi(vi: *const vs.VideoInfo) [2]u32 {
+    const n: u32 = vsFrameAlignmentT(@intCast(vi.format.bytesPerSample));
+    const ssw: u3 = @intCast(vi.format.subSamplingW);
+    return .{
+        @intCast(ceilN(@intCast(vi.width), n)),
+        @intCast(ceilN(@intCast(vi.width >> ssw), n)),
+    };
+}
+
+pub fn vsFrameAlignmentT(div: u32) u32 {
+    return @divExact(vsFrameAlignment(), div);
+}
+
+/// VapourSynth aligns every frame's plane rows to `VSFrame::alignment` bytes,
+/// which it picks once at startup from the *running* CPU: 64 bytes when AVX-512F
+/// is available, otherwise 32 (and 32 on non-x86) — see `alignmentHelper()` in vscore.cpp.
+pub fn vsFrameAlignment() u32 {
+    if (comptime (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .x86)) {
+        // Replicates cpufeatures.cpp's `avx512_f` derivation exactly.
+        // 1. CPUID.1:ECX must report OSXSAVE(27) + AVX(28).
+        const leaf1 = cpuid(1, 0);
+        const osxsave_avx: u32 = (1 << 27) | (1 << 28);
+        if ((leaf1.ecx & osxsave_avx) != osxsave_avx) return 32;
+
+        // 2. The OS must have enabled AVX state (XCR0 XMM+YMM bits).
+        const xcr0 = getXCR0();
+        if ((xcr0 & 0x06) != 0x06) return 32;
+
+        // 3. AVX-512F (CPUID.7.0:EBX bit 16) AND OS-enabled AVX-512 state (XCR0
+        //    opmask+ZMM bits) => 64-byte frames, matching VSFrame::alignment.
+        const leaf7 = cpuid(7, 0);
+        if ((leaf7.ebx & (1 << 16)) != 0 and (xcr0 & 0xE0) == 0xE0) return 64;
+    }
+    return 32;
+}
+
+const CpuidLeaf = struct { eax: u32, ebx: u32, ecx: u32, edx: u32 };
+
+fn cpuid(leaf: u32, subleaf: u32) CpuidLeaf {
+    var eax: u32 = undefined;
+    var ebx: u32 = undefined;
+    var ecx: u32 = undefined;
+    var edx: u32 = undefined;
+    asm volatile ("cpuid"
+        : [_] "={eax}" (eax),
+          [_] "={ebx}" (ebx),
+          [_] "={ecx}" (ecx),
+          [_] "={edx}" (edx),
+        : [_] "{eax}" (leaf),
+          [_] "{ecx}" (subleaf),
+    );
+    return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
+}
+
+/// Read XCR0 (low 32 bits hold every AVX / AVX-512 state bit we test).
+fn getXCR0() u32 {
+    return asm volatile (
+        \\ xor %%ecx, %%ecx
+        \\ xgetbv
+        : [_] "={eax}" (-> u32),
+        :
+        : .{ .edx = true, .ecx = true });
+}
+
+pub inline fn ceilN(x: u32, n: u32) u32 {
+    return (x + (n - 1)) & ~(n - 1);
 }

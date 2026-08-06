@@ -24,14 +24,14 @@ const Data = struct {
 
 pub fn LimiterRT(comptime T: type, np: comptime_int, idx: comptime_int) type {
     return struct {
-        pub fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) ?*const vs.Frame {
+        pub fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) ?*const vs.Frame {
             const d: *Data = @ptrCast(@alignCast(instance_data));
-            const zapi = ZAPI.init(vsapi, core);
+            const zapi = ZAPI.init(vsapi, core, frame_ctx);
 
             if (activation_reason == .Initial) {
-                zapi.requestFrameFilter(n, d.node, frame_ctx);
+                zapi.requestFrameFilter(n, d.node);
             } else if (activation_reason == .AllFramesReady) {
-                const src = zapi.initZFrame(d.node, n, frame_ctx);
+                const src = zapi.initZFrame(d.node, n);
                 defer src.deinit();
                 const dst = src.newVideoFrame2(comptime_planes[idx]);
 
@@ -42,12 +42,7 @@ pub fn LimiterRT(comptime T: type, np: comptime_int, idx: comptime_int) type {
                     const max: T = if (@typeInfo(T) == .int) @intCast(d.max[plane]) else @floatCast(d.maxf[plane]);
                     const min: T = if (@typeInfo(T) == .int) @intCast(d.min[plane]) else @floatCast(d.minf[plane]);
 
-                    for (
-                        src.getReadSlice2(T, plane),
-                        dst.getWriteSlice2(T, plane),
-                    ) |*srcp, *dstp| {
-                        dstp.* = @min(@max(min, srcp.*), max);
-                    }
+                    filter.clampSlice(T, dst.getWriteSlice2(T, plane), src.getReadSlice2(T, plane), min, max);
                 }
 
                 return dst.frame;
@@ -60,14 +55,14 @@ pub fn LimiterRT(comptime T: type, np: comptime_int, idx: comptime_int) type {
 
 pub fn Limiter(comptime T: type, rng: anytype, np: comptime_int, idx: comptime_int) type {
     return struct {
-        pub fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) ?*const vs.Frame {
+        pub fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) ?*const vs.Frame {
             const d: *Data = @ptrCast(@alignCast(instance_data));
-            const zapi = ZAPI.init(vsapi, core);
+            const zapi = ZAPI.init(vsapi, core, frame_ctx);
 
             if (activation_reason == .Initial) {
-                zapi.requestFrameFilter(n, d.node, frame_ctx);
+                zapi.requestFrameFilter(n, d.node);
             } else if (activation_reason == .AllFramesReady) {
-                const src = zapi.initZFrame(d.node, n, frame_ctx);
+                const src = zapi.initZFrame(d.node, n);
                 defer src.deinit();
                 const dst = src.newVideoFrame2(comptime_planes[idx]);
 
@@ -75,12 +70,7 @@ pub fn Limiter(comptime T: type, rng: anytype, np: comptime_int, idx: comptime_i
                 inline while (plane < np) : (plane += 1) {
                     if (!(comptime_planes[idx][plane])) continue;
 
-                    for (
-                        src.getReadSlice2(T, plane),
-                        dst.getWriteSlice2(T, plane),
-                    ) |*srcp, *dstp| {
-                        dstp.* = @min(@max(rng[0][plane], srcp.*), rng[1][plane]);
-                    }
+                    filter.clampSlice(T, dst.getWriteSlice2(T, plane), src.getReadSlice2(T, plane), rng[0][plane], rng[1][plane]);
                 }
 
                 return dst.frame;
@@ -91,18 +81,18 @@ pub fn Limiter(comptime T: type, rng: anytype, np: comptime_int, idx: comptime_i
     };
 }
 
-fn limiterFree(instance_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) void {
+fn limiterFree(instance_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     const d: *Data = @ptrCast(@alignCast(instance_data));
-    const zapi = ZAPI.init(vsapi, core);
+    const zapi = ZAPI.init(vsapi, core, null);
 
     zapi.freeNode(d.node);
     allocator.destroy(d);
 }
 
-pub fn limiterCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) void {
+pub fn limiterCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     var d: Data = .{};
 
-    const zapi = ZAPI.init(vsapi, core);
+    const zapi = ZAPI.init(vsapi, core, null);
     const map_in = zapi.initZMap(in);
     const map_out = zapi.initZMap(out);
     d.node, d.vi = map_in.getNodeVi("clip").?;
@@ -128,7 +118,7 @@ pub fn limiterCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*
 
         for (0..arr.len) |i| {
             if (d.vi.format.sampleType == .Integer) {
-                const val: i64 = @intFromFloat(arr[i]);
+                const val: i64 = @trunc(arr[i]);
 
                 if (val < 0) {
                     map_out.setError(filter_name ++ ": min value must be greater than or equal to 0.");
@@ -136,8 +126,20 @@ pub fn limiterCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*
                     return;
                 }
 
+                if (arr[i] > peak) {
+                    map_out.setError(filter_name ++ ": min value must be less than or equal to peak value.");
+                    zapi.freeNode(d.node);
+                    return;
+                }
+
                 d.min[i] = @intCast(val);
             } else {
+                if (math.isNan(arr[i])) {
+                    map_out.setError(filter_name ++ ": min value must not be NaN.");
+                    zapi.freeNode(d.node);
+                    return;
+                }
+
                 d.minf[i] = @floatCast(arr[i]);
             }
         }
@@ -154,7 +156,7 @@ pub fn limiterCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*
 
         for (0..arr.len) |i| {
             if (d.vi.format.sampleType == .Integer) {
-                const val: i64 = @intFromFloat(arr[i]);
+                const val: i64 = @trunc(arr[i]);
 
                 if (arr[i] > peak) {
                     map_out.setError(filter_name ++ ": max value must be less than or equal to peak value.");
@@ -162,8 +164,20 @@ pub fn limiterCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*
                     return;
                 }
 
+                if (val < 0) {
+                    map_out.setError(filter_name ++ ": max value must be greater than or equal to 0.");
+                    zapi.freeNode(d.node);
+                    return;
+                }
+
                 d.max[i] = @intCast(val);
             } else {
+                if (math.isNan(arr[i])) {
+                    map_out.setError(filter_name ++ ": max value must not be NaN.");
+                    zapi.freeNode(d.node);
+                    return;
+                }
+
                 d.maxf[i] = @floatCast(arr[i]);
             }
         }
@@ -181,7 +195,34 @@ pub fn limiterCreate(in: ?*const vs.Map, out: ?*vs.Map, _: ?*anyopaque, core: ?*
         return;
     }
 
+    if (has_min and has_max) {
+        for (0..@as(usize, @intCast(num_planes))) |p| {
+            const bad = if (d.vi.format.sampleType == .Integer)
+                d.min[p] > d.max[p]
+            else
+                d.minf[p] > d.maxf[p];
+            if (bad) {
+                map_out.setError(filter_name ++ ": min value must be less than or equal to max value.");
+                zapi.freeNode(d.node);
+                return;
+            }
+        }
+    }
+
     const bps = BPSType.select(map_out, d.node, d.vi, filter_name) catch return;
+
+    // Default args on an 8/16/32-bit integer clip clamp to the full range of
+    // the carrier type — the identity. Pass the clip through instead of
+    // instantiating a filter that byte-copies every plane (measured: the full8
+    // variant is 100% of kernel work for the default 8-bit invocation).
+    // 9..14-bit formats are excluded: their u16 carrier can hold values above
+    // the nominal peak, which the full-range table really does clamp.
+    if (!has_min and !(map_in.getBool("tv_range") orelse false) and
+        (bps == .U8 or bps == .U16 or bps == .U32))
+    {
+        _ = map_out.consumeNode("clip", d.node, .Replace);
+        return;
+    }
 
     var i: u32 = 0;
     const idx: u32 = while (i < comptime_planes.len) : (i += 1) {

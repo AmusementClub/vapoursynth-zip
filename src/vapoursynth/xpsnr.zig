@@ -10,7 +10,7 @@ const vs = vapoursynth.vapoursynth4;
 const vsh = vapoursynth.vshelper;
 const vsc = vapoursynth.vsconstants;
 const ZAPI = vapoursynth.ZAPI;
-const Mutex = std.Thread.Mutex;
+const Mutex = std.Io.Mutex;
 
 const allocator = std.heap.c_allocator;
 pub const filter_name = "XPSNR";
@@ -19,10 +19,7 @@ pub const Data = struct {
     node1: *vs.Node = undefined,
     node2: *vs.Node = undefined,
     vi: *const vs.VideoInfo = undefined,
-    mutex: Mutex = undefined,
-
-    og_m1: []i16 = undefined,
-    og_m2: []i16 = undefined,
+    mutex: Mutex = .init,
 
     depth: u6 = 0,
     num_comps: u8 = 0,
@@ -39,25 +36,39 @@ pub const Data = struct {
 
 fn XPSNR(comptime T: type) type {
     return struct {
-        pub fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) ?*const vs.Frame {
+        pub fn getFrame(n: c_int, activation_reason: vs.ActivationReason, instance_data: ?*anyopaque, _: ?*?*anyopaque, frame_ctx: ?*vs.FrameContext, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) ?*const vs.Frame {
             const d: *Data = @ptrCast(@alignCast(instance_data));
-            const zapi = ZAPI.init(vsapi, core);
+            const zapi = ZAPI.init(vsapi, core, frame_ctx);
 
             if (activation_reason == .Initial) {
-                zapi.requestFrameFilter(n, d.node1, frame_ctx);
-                zapi.requestFrameFilter(n, d.node2, frame_ctx);
+                zapi.requestFrameFilter(n, d.node1);
+                zapi.requestFrameFilter(n, d.node2);
+                if (d.temporal) {
+                    if (n > 0) zapi.requestFrameFilter(n - 1, d.node1);
+                    if ((d.frame_rate >= 32) and (n > 1)) zapi.requestFrameFilter(n - 2, d.node1);
+                }
             } else if (activation_reason == .AllFramesReady) {
-                d.mutex.lock();
-                defer d.mutex.unlock();
-
-                const src1 = zapi.initZFrame(d.node1, n, frame_ctx);
-                const src2 = zapi.initZFrame(d.node2, n, frame_ctx);
+                const src1 = zapi.initZFrame(d.node1, n);
+                const src2 = zapi.initZFrame(d.node2, n);
                 defer src1.deinit();
                 defer src2.deinit();
                 const dst = src2.copyFrame();
 
+                // Temporal activity is computed against the actual previous
+                // frame(s); a missing previous frame (n == 0/1) means "all
+                // zeros", matching the zero-initialized state of the old
+                // serial implementation.
+                var src_p1: ?@TypeOf(src1) = null;
+                var src_p2: ?@TypeOf(src1) = null;
+                if (d.temporal and (n > 0)) src_p1 = zapi.initZFrame(d.node1, n - 1);
+                if (d.temporal and (d.frame_rate >= 32) and (n > 1)) src_p2 = zapi.initZFrame(d.node1, n - 2);
+                defer if (src_p1) |f| f.deinit();
+                defer if (src_p2) |f| f.deinit();
+
                 const orgp = src1.getReadSlices2(T);
                 const recp = src2.getReadSlices2(T);
+                const prv1: ?[]const T = if (src_p1) |f| f.getReadSlice2(T, 0) else null;
+                const prv2: ?[]const T = if (src_p2) |f| f.getReadSlice2(T, 0) else null;
                 var wsse64 = [3]u64{ 0, 0, 0 };
                 var cur_xpsnr = [3]f64{ math.inf(f64), math.inf(f64), math.inf(f64) };
 
@@ -67,16 +78,22 @@ fn XPSNR(comptime T: type) type {
                     strides[c] = src1.getStride2(T, c);
                 }
 
-                filter.getWSSE(T, orgp, recp, d.og_m1, d.og_m2, &wsse64, d.width, d.height, strides, d.depth, d.num_comps, d.frame_rate, d.temporal);
+                filter.getWSSE(T, orgp, recp, prv1, prv2, &wsse64, d.width, d.height, strides, d.depth, d.num_comps, d.frame_rate, d.temporal);
 
                 var i: u32 = 0;
                 while (i < d.num_comps) : (i += 1) {
-                    const sqrt_wsse: f64 = @sqrt(@as(f64, @floatFromInt(wsse64[i])));
+                    const sqrt_wsse: f64 = @sqrt(@floatFromInt(wsse64[i]));
                     cur_xpsnr[i] = filter.getFrameXPSNR(sqrt_wsse, d.width[i], d.height[i], d.max_error_64);
+                }
 
-                    d.sum_wdist[i] += sqrt_wsse;
+                d.mutex.lockUncancelable(vszip.io);
+                d.num_frames_64 += 1;
+                i = 0;
+                while (i < d.num_comps) : (i += 1) {
+                    d.sum_wdist[i] += @sqrt(@as(f64, @floatFromInt(wsse64[i])));
                     d.sum_xpsnr[i] += cur_xpsnr[i];
                 }
+                d.mutex.unlock(vszip.io);
 
                 const dst_props = dst.getPropertiesRW();
                 dst_props.setFloat("XPSNR_Y", cur_xpsnr[0], .Replace);
@@ -90,14 +107,15 @@ fn XPSNR(comptime T: type) type {
     };
 }
 
-fn xpsnrFree(instance_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) void {
+fn xpsnrFree(instance_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     const d: *Data = @ptrCast(@alignCast(instance_data));
-    const zapi = ZAPI.init(vsapi, core);
+    const zapi = ZAPI.init(vsapi, core, null);
 
     if (d.verbose) {
-        var bw = std.io.bufferedWriter(std.io.getStdOut().writer());
-        const stdout = bw.writer();
-        stdout.print("XPSNR average, {} frames  ", .{d.vi.numFrames}) catch unreachable;
+        var stdout_buffer: [1024]u8 = undefined;
+        var stdout_writer = std.Io.File.stdout().writerStreaming(vszip.io, &stdout_buffer);
+        const stdout = &stdout_writer.interface;
+        stdout.print("XPSNR average, {} frames  ", .{d.num_frames_64}) catch unreachable;
         const char = [_]u8{ 'y', 'u', 'v' };
 
         for (0..d.num_comps) |i| {
@@ -106,21 +124,18 @@ fn xpsnrFree(instance_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API)
         }
 
         stdout.print("\n", .{}) catch unreachable;
-        bw.flush() catch unreachable;
+        stdout.flush() catch unreachable;
     }
 
     zapi.freeNode(d.node1);
     zapi.freeNode(d.node2);
-
-    allocator.free(d.og_m1);
-    allocator.free(d.og_m2);
     allocator.destroy(d);
 }
 
-pub fn xpsnrCreate(in: ?*const vs.Map, out: ?*vs.Map, user_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.C) void {
+pub fn xpsnrCreate(in: ?*const vs.Map, out: ?*vs.Map, user_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     _ = user_data;
     var d: Data = .{};
-    const zapi = ZAPI.init(vsapi, core);
+    const zapi = ZAPI.init(vsapi, core, null);
     const map_in = zapi.initZMap(in);
     const map_out = zapi.initZMap(out);
 
@@ -138,13 +153,19 @@ pub fn xpsnrCreate(in: ?*const vs.Map, out: ?*vs.Map, user_data: ?*anyopaque, co
         return;
     }
 
+    if (((vi1.width & 1) != 0) or ((vi1.height & 1) != 0)) {
+        map_out.setError(filter_name ++ " : only supports even width and height");
+        zapi.freeNode(d.node1);
+        return;
+    }
+
     d.node2, const vi2 = map_in.getNodeVi("distorted").?;
-    const bps1: u6 = @intCast(vi1.format.bitsPerSample);
-    const bps2: u6 = @intCast(vi2.format.bitsPerSample);
+    const bps1: u32 = @intCast(vi1.format.bitsPerSample);
+    const bps2: u32 = @intCast(vi2.format.bitsPerSample);
     if (bps1 < bps2) {
-        d.node1 = bitDepth(bps2, d.node1, &zapi);
+        d.node1 = hz.bitDepth(bps2, d.node1, .none, &zapi);
     } else if (bps1 > bps2) {
-        d.node2 = bitDepth(bps1, d.node2, &zapi);
+        d.node2 = hz.bitDepth(bps1, d.node2, .none, &zapi);
     }
 
     d.vi = zapi.getVideoInfo(d.node1);
@@ -157,27 +178,24 @@ pub fn xpsnrCreate(in: ?*const vs.Map, out: ?*vs.Map, user_data: ?*anyopaque, co
     d.depth = @intCast(d.vi.format.bitsPerSample);
     d.max_error_64 = math.shl(u64, 1, d.depth) - 1;
     d.max_error_64 *= d.max_error_64;
-    d.frame_rate = @intCast(@divTrunc(d.vi.fpsNum, d.vi.fpsDen));
+
+    d.frame_rate = if (vi2.fpsDen != 0)
+        @intCast(@divTrunc(vi2.fpsNum, vi2.fpsDen))
+    else if (d.vi.fpsDen != 0)
+        @intCast(@divTrunc(d.vi.fpsNum, d.vi.fpsDen))
+    else
+        0;
     d.num_comps = @intCast(d.vi.format.numPlanes);
-    d.num_frames_64 = @intCast(d.vi.numFrames);
 
     const whv = whFromVi(d.vi);
     d.width = whv.w;
     d.height = whv.h;
 
-    const wh: u32 = whv.w[0] * whv.h[0];
-    d.og_m1 = allocator.alignedAlloc(i16, 32, wh) catch unreachable;
-    d.og_m2 = allocator.alignedAlloc(i16, 32, wh) catch unreachable;
-    @memset(d.og_m1, 0);
-    @memset(d.og_m2, 0);
-
-    d.mutex = Mutex{};
-
     const data: *Data = allocator.create(Data) catch unreachable;
     data.* = d;
 
     const deps = [_]vs.FilterDependency{
-        .{ .source = d.node1, .requestPattern = .StrictSpatial },
+        .{ .source = d.node1, .requestPattern = .General },
         .{ .source = d.node2, .requestPattern = .StrictSpatial },
     };
 
@@ -185,30 +203,6 @@ pub fn xpsnrCreate(in: ?*const vs.Map, out: ?*vs.Map, user_data: ?*anyopaque, co
     zapi.createVideoFilter(out, filter_name, d.vi, gf, xpsnrFree, .Parallel, &deps, data);
 }
 
-pub fn bitDepth(bitdepth: u6, node: *vs.Node, zapi: *const ZAPI) *vs.Node {
-    const vf = zapi.getVideoInfo(node).format;
-    if (vf.bitsPerSample == bitdepth) {
-        return node;
-    }
-
-    const vf_out = vs.makeVideoID(
-        vf.colorFamily,
-        vf.sampleType,
-        bitdepth,
-        @intCast(vf.subSamplingW),
-        @intCast(vf.subSamplingH),
-    );
-
-    const args = zapi.createZMap();
-    _ = args.consumeNode("clip", node, .Replace);
-    args.setInt("format", vf_out, .Replace);
-    const vsplugin = zapi.getPluginByID2(.Resize);
-    const ret = args.invoke(vsplugin, "Point");
-    const out = ret.getNode("clip").?;
-    ret.free();
-    args.free();
-    return out;
-}
 fn whFromVi(vi: *const vs.VideoInfo) struct { w: [3]u32, h: [3]u32 } {
     const w: u32 = @intCast(vi.width);
     const h: u32 = @intCast(vi.height);
